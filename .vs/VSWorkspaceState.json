@@ -1,0 +1,18 @@
+{
+  "ExpandedNodes": [
+    "",
+    "\\api",
+    "\\api\\migrations",
+    "\\api\\migrations\\__pycache__",
+    "\\member_portal",
+    "\\static",
+    "\\staticfiles",
+    "\\staticfiles\\admin",
+    "\\staticfiles\\admin\\img",
+    "\\staticfiles\\admin\\js",
+    "\\staticfiles\\admin\\js\\admin",
+    "\\staticfiles\\admin\\js\\vendor"
+  ],
+  "SelectedNode": "\\staticfiles\\admin\\js\\SelectBox.js",
+  "PreviewInSolutionExplorer": false
+}

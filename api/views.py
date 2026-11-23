@@ -449,10 +449,16 @@ class LoanProductsView(APIView):
         return Response(data, status=status.HTTP_200_OK)
     
 class ApplyLoanView(APIView):
-    # permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated]
 
     def post(self, request):
         data = request.data
+        member_no = request.user.get_username()
+        supplied_member_no = data.get("bosa_no")
+        if not isinstance(supplied_member_no, str) or not supplied_member_no.strip():
+            return Response({"error": "bosa_no is required"}, status=400)
+        if supplied_member_no.strip().casefold() != member_no.strip().casefold():
+            return Response({"error": "Access denied."}, status=403)
         
         print(f"\n{'='*80}")
         print("🚀 RECEIVED LOAN APPLICATION REQUEST")
@@ -546,7 +552,7 @@ class ApplyLoanView(APIView):
             
             # First, submit the main loan application
             application_result = apply_for_loan(
-                bosa_no=data["bosa_no"],
+                bosa_no=member_no,
                 loan_type=data["loan_type"],
                 loan_amount=data["loan_amount"],
                 loan_purpose=data["loan_purpose"],

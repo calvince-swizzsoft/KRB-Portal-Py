@@ -1,0 +1,30 @@
+# Python bytecode and tool caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+/htmlcov/
+
+# Local virtual environments and settings
+/.venv/
+/venv/
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+
+# Django local database and collectstatic output
+/db.sqlite3
+/db.sqlite3-*
+/staticfiles/
+
+# Local IDE and OS files
+/.vs/
+*.suo
+*.user
+Thumbs.db
+.DS_Store

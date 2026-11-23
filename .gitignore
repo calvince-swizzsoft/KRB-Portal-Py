@@ -28,3 +28,6 @@ __pycache__/
 *.user
 Thumbs.db
 .DS_Store
+
+# Machine-specific local launcher
+/run-local.ps1

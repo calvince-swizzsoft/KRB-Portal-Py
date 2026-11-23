@@ -20,7 +20,8 @@ from .soap_client import get_loan_statement_pdf
 from .soap_client import get_loan_products_with_details
 from .soap_client import apply_for_loan
 from .soap_client import get_online_applied_loans
-from .soap_client import request_guarantorship
+from decimal import Decimal, InvalidOperation
+from .soap_client import guarantorship_policy, request_guarantorship
 from .soap_client import edit_online_loan
 from .soap_client import get_loan_guarantors
 from .soap_client import get_member_sharecertificate_pdf
@@ -36,12 +37,17 @@ from .soap_client import edit_member_details
 from .soap_client import get_active_members
 from .soap_client import update_member_next_of_kin
 from .soap_client import update_member_nominee
+from .soap_client import get_member_blacklist_status
 from rest_framework.permissions import IsAuthenticated
 from typing import Any
 import logging
+from base64 import b64decode
+from binascii import Error as Base64Error
 from rest_framework_simplejwt.tokens import RefreshToken
 from django.contrib.auth import authenticate
 from django.contrib.auth.models import User
+from .soap_client import get_member_existing_loans
+from .soap_client import apply_loan_refinancing
 
 
 
@@ -213,7 +219,10 @@ class MemberProfileView(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        result = get_member_profile(member_no)
+        if member_no.strip().casefold() != request.user.get_username().strip().casefold():
+            return Response({"error": "Access denied."}, status=status.HTTP_403_FORBIDDEN)
+
+        result = get_member_profile(request.user.get_username())
 
         if result.get("status") != "success":
             return Response(
@@ -226,19 +235,21 @@ class MemberProfileView(APIView):
             "profile":      result["profile"],
             "next_of_kin":  result.get("next_of_kin", []),
             "nominees":     result.get("nominees", [])
-        }, status=status.HTTP_200_OK)
+        }, status=status.HTTP_200_OK, headers={"Cache-Control": "private, no-store"})
 
 
 
 logger = logging.getLogger(__name__)
+
+MAX_PROFILE_IMAGE_BYTES = 5_000_000
+MAX_PROFILE_IMAGE_BASE64_LENGTH = ((MAX_PROFILE_IMAGE_BYTES + 2) // 3) * 4
+
 
 class EditMemberDetailsView(APIView):
 
     def post(self, request):
         try:
             data = request.data
-
-            logger.info("Received POST data for edit-member-details: %s", data)
 
             member_number = data.get("memberNumber")
             full_names = data.get("fullNames")
@@ -254,6 +265,27 @@ class EditMemberDetailsView(APIView):
             if not member_number:
                 logger.warning("memberNumber is missing in request")
                 return Response({"error": "memberNumber is required."}, status=400)
+
+            images = {
+                "imageBlob": image_blob,
+                "kRAPinDocumentPic": kra_pin_doc_pic,
+                "idFront": id_front,
+                "idBack": id_back,
+            }
+            for field, image in images.items():
+                if image is None or image == "":
+                    continue
+                if not isinstance(image, str):
+                    return Response({"error": f"{field} must be Base64 text."}, status=400)
+                too_large = {"error": f"{field} exceeds the 5 MB image limit."}
+                if len(image) > MAX_PROFILE_IMAGE_BASE64_LENGTH:
+                    return Response(too_large, status=413)
+                try:
+                    image_size = len(b64decode(image, validate=True))
+                except (Base64Error, ValueError):
+                    return Response({"error": f"{field} contains invalid Base64."}, status=400)
+                if image_size > MAX_PROFILE_IMAGE_BYTES:
+                    return Response(too_large, status=413)
 
             result = edit_member_details(
                 member_number=member_number,
@@ -407,7 +439,7 @@ class LoanStatementReportView(APIView):
 
 
 class LoanProductsView(APIView):
-    permission_classes = [IsAuthenticated]
+    #permission_classes = [IsAuthenticated]
     def get(self, request):
         data = get_loan_products_with_details()
 
@@ -417,27 +449,283 @@ class LoanProductsView(APIView):
         return Response(data, status=status.HTTP_200_OK)
     
 class ApplyLoanView(APIView):
-    permission_classes = [IsAuthenticated]
+    # permission_classes = [IsAuthenticated]
 
     def post(self, request):
         data = request.data
-        bosa_no = data.get("bosa_no")
-        loan_type = data.get("loan_type")
-        loan_amount = data.get("loan_amount")
-        loan_purpose = data.get("loan_purpose")
-        repayment_period = data.get("repayment_period")
+        
+        print(f"\n{'='*80}")
+        print("🚀 RECEIVED LOAN APPLICATION REQUEST")
+        print(f"{'='*80}")
+        print("Request Data:")
+        for key, value in data.items():
+            if key != "refinance_loans":
+                print(f"  {key}: {value}")
+        
+        refinance_loans = data.get("refinance_loans", [])
+        if refinance_loans:
+            print(f"\nRefinance Loans Selected: {len(refinance_loans)}")
+            for i, loan in enumerate(refinance_loans):
+                print(f"  Loan {i+1}: {loan}")
 
-        if not all([bosa_no, loan_type, loan_amount, loan_purpose, repayment_period]):
-            return Response({"status": "error", "message": "All fields are required"}, status=400)
+        # Define required fields - ALL modes require these
+        required_fields = [
+            "bosa_no", "loan_type", "loan_amount", "loan_purpose",
+            "repayment_period", "disbursement_mode", "recovery_mode"
+        ]
+        
+        # Check disbursement mode to determine additional requirements
+        disbursement_mode = data.get("disbursement_mode")
+        
+        # Convert to integer for comparison
+        try:
+            disbursement_mode_int = int(disbursement_mode)
+        except (ValueError, TypeError):
+            error_msg = "disbursement_mode must be a valid number"
+            print(f"\n❌ VALIDATION FAILED: {error_msg}")
+            return Response({"error": error_msg}, status=400)
+        
+        # Check for basic required fields
+        for field in required_fields:
+            if not data.get(field):
+                error_msg = f"{field} is required"
+                print(f"\n❌ VALIDATION FAILED: {error_msg}")
+                return Response({"error": error_msg}, status=400)
+        
+        # Validate based on disbursement mode
+        if disbursement_mode_int == 4:  # Bank Transfer
+            # For Bank Transfer, both account number and bank selection are required
+            if not data.get("account_or_mpesa_no"):
+                error_msg = "account_or_mpesa_no is required for Bank Transfer"
+                print(f"\n❌ VALIDATION FAILED: {error_msg}")
+                return Response({"error": error_msg}, status=400)
+            
+            if not data.get("member_bank"):
+                error_msg = "member_bank is required for Bank Transfer"
+                print(f"\n❌ VALIDATION FAILED: {error_msg}")
+                return Response({"error": error_msg}, status=400)
+                
+        elif disbursement_mode_int == 8:  # Mobile Money
+            # For Mobile Money, only mobile number is required
+            if not data.get("account_or_mpesa_no"):
+                error_msg = "account_or_mpesa_no is required for Mobile Money"
+                print(f"\n❌ VALIDATION FAILED: {error_msg}")
+                return Response({"error": error_msg}, status=400)
+            
+            # Mobile Money doesn't require member_bank, but we need to ensure it's set to 0
+            if not data.get("member_bank"):
+                data["member_bank"] = 0
+                
+        elif disbursement_mode_int == 2:  # Cash
+            # For Cash, neither account number nor bank is required
+            # But we need to ensure they're set to empty/default values
+            if not data.get("account_or_mpesa_no"):
+                data["account_or_mpesa_no"] = ""
+            
+            if not data.get("member_bank"):
+                data["member_bank"] = 0
+        else:
+            error_msg = "Invalid disbursement mode selected"
+            print(f"\n❌ VALIDATION FAILED: {error_msg}")
+            return Response({"error": error_msg}, status=400)
+        
+        # Ensure account_or_mpesa_no is always a string (even if empty)
+        if data.get("account_or_mpesa_no") is None:
+            data["account_or_mpesa_no"] = ""
+        
+        # Ensure member_bank is always set (default to 0 if not provided)
+        if data.get("member_bank") is None:
+            data["member_bank"] = 0
+        
+        application_result = {}
+        
+        try:
+            print(f"\n{'='*80}")
+            print("📋 STEP 1: Processing main loan application...")
+            print(f"{'='*80}")
+            
+            # First, submit the main loan application
+            application_result = apply_for_loan(
+                bosa_no=data["bosa_no"],
+                loan_type=data["loan_type"],
+                loan_amount=data["loan_amount"],
+                loan_purpose=data["loan_purpose"],
+                repayment_period=data["repayment_period"],
+                disbursement_mode=data["disbursement_mode"],
+                recovery_mode=data["recovery_mode"],
+                account_or_mpesa_no=data["account_or_mpesa_no"],
+                member_bank=data["member_bank"]
+            )
+            
+            # If loan application failed, return the error immediately
+            if application_result.get("status") == "error":
+                print(f"\n❌ MAIN LOAN APPLICATION FAILED")
+                print(f"Error: {application_result.get('message')}")
+                return Response(application_result, status=500)
+            
+            # Get the success message and loan number
+            success_message = application_result.get("message", "")
+            loan_no = application_result.get("loan_no")
+            
+            print(f"\n{'='*80}")
+            print("✅ MAIN LOAN APPLICATION SUCCESSFUL!")
+            print(f"{'='*80}")
+            print(f"Success Message: {success_message}")
+            print(f"Loan Number from API: {loan_no}")
+            
+            # If we have a loan number, use it for refinancing
+            # If not, try to extract from success message (for backward compatibility)
+            if not loan_no:
+                # Check if the entire message is a loan number (e.g., "PLN030")
+                if success_message and success_message.isalnum() and len(success_message) <= 20:
+                    loan_no = success_message
+                    print(f"Using entire message as loan number: {loan_no}")
+                else:
+                    # Try to extract from formatted message
+                    import re
+                    loan_no_match = re.search(r'LOAN\s*NUMBER\s*[:=\-]?\s*([A-Z0-9]+)', success_message.upper())
+                    if loan_no_match:
+                        loan_no = loan_no_match.group(1)
+                        print(f"Extracted Loan Number from message: {loan_no}")
+            
+            # If refinancing loans were selected, process them
+            refinancing_results = []
+            if refinance_loans and isinstance(refinance_loans, list) and loan_no:
+                print(f"\n{'='*80}")
+                print("🔄 STEP 2: Processing loan refinancing...")
+                print(f"Number of loans to refinance: {len(refinance_loans)}")
+                print(f"New Loan Number for refinancing: {loan_no}")
+                print(f"{'='*80}")
+                
+                for i, refinance_loan in enumerate(refinance_loans):
+                    if isinstance(refinance_loan, dict):
+                        # Get required fields
+                        existing_loan_no = refinance_loan.get("loan_no")
+                        loan_type_for_refinance = refinance_loan.get("loan_type")
+                        arrears_amount = refinance_loan.get("arrears_amount", 0)
+                        
+                        print(f"\nProcessing refinancing {i+1}/{len(refinance_loans)}:")
+                        print(f"  Existing Loan No: {existing_loan_no}")
+                        print(f"  Loan Type: {loan_type_for_refinance}")
+                        print(f"  Arrears Amount: {arrears_amount}")
+                        
+                        # Validate required fields
+                        if not existing_loan_no or not loan_type_for_refinance:
+                            print(f"  ⚠️  SKIPPING: Missing required fields")
+                            continue
+                            
+                        # Try to call refinancing
+                        try:
+                            print(f"  Calling SOAP API for refinancing...")
+                            refinancing_result = apply_loan_refinancing(
+                                bosa_no=data["bosa_no"],
+                                loan_no=loan_no,  # New loan number
+                                loan_top_up_no=existing_loan_no,
+                                loan_type=loan_type_for_refinance,
+                                amount=arrears_amount
+                            )
+                            
+                            print(f"  Refinancing Result: {refinancing_result.get('status')}")
+                            print(f"  Message: {refinancing_result.get('message')}")
+                            
+                            refinancing_results.append({
+                                "existing_loan_no": existing_loan_no,
+                                "result": refinancing_result
+                            })
+                        except Exception as e:
+                            error_msg = f"Failed: {str(e)}"
+                            print(f"  ❌ ERROR: {error_msg}")
+                            refinancing_results.append({
+                                "existing_loan_no": existing_loan_no,
+                                "result": {"status": "error", "message": error_msg}
+                            })
+            
+            # Prepare final response
+            response_data = {
+                "status": "success",
+                "message": success_message,
+                "loan_no": loan_no,
+                "refinancing_processed": len(refinance_loans) > 0,
+                "refinancing_success_count": len([r for r in refinancing_results if r.get("result", {}).get("status") == "success"])
+            }
+            
+            if refinancing_results:
+                response_data["refinancing_results"] = refinancing_results
+            
+            print(f"\n{'='*80}")
+            print("🎯 FINAL RESPONSE PREPARED")
+            print(f"{'='*80}")
+            print(f"Overall Status: {response_data['status']}")
+            print(f"Loan Number: {response_data['loan_no']}")
+            print(f"Refinancing Processed: {response_data['refinancing_processed']}")
+            print(f"Successful Refinancings: {response_data['refinancing_success_count']}")
+            print(f"{'='*80}")
+            
+            return Response(response_data, status=200)
+            
+        except Exception as e:
+            print(f"\n{'='*80}")
+            print("❌ UNEXPECTED ERROR IN LOAN APPLICATION")
+            print(f"{'='*80}")
+            print(f"Error: {str(e)}")
+            import traceback
+            print(f"Traceback: {traceback.format_exc()}")
+            
+            if application_result:
+                return Response(application_result, status=500)
+            return Response({"status": "error", "message": f"Loan application failed: {str(e)}"}, status=500)
 
-        result = apply_for_loan(bosa_no, loan_type, loan_amount, loan_purpose, repayment_period)
-
-        if result.get("status") == "error":
-            return Response(result, status=400)
-
-        return Response(result, status=200)
-
-
+class GetMemberExistingLoansView(APIView):
+    # permission_classes = [IsAuthenticated]
+    
+    def get(self, request):
+        bosa_no = request.query_params.get("bosa_no")
+        
+        if not bosa_no:
+            return Response({"error": "bosa_no is required"}, status=400)
+        
+        result = get_member_existing_loans(bosa_no)
+        
+        if "error" in result:
+            return Response(result, status=500)
+        
+        return Response(result)
+    
+    
+class OnlineLoanRefinancingView(APIView):
+    # permission_classes = [IsAuthenticated]
+    
+    def post(self, request):
+        data = request.data
+        
+        required_fields = [
+            "bosa_no", "loan_no", "loan_top_up_no", 
+            "loan_type", "amount"
+        ]
+        
+        for field in required_fields:
+            if not data.get(field):
+                return Response({"error": f"{field} is required"}, status=400)
+        
+        try:
+            # Validate amount is numeric
+            amount = float(data["amount"])
+            if amount <= 0:
+                return Response({"error": "Amount must be greater than 0"}, status=400)
+        except ValueError:
+            return Response({"error": "Amount must be a valid number"}, status=400)
+        
+        result = apply_loan_refinancing(
+            bosa_no=data["bosa_no"],
+            loan_no=data["loan_no"],
+            loan_top_up_no=data["loan_top_up_no"],
+            loan_type=data["loan_type"],
+            amount=data["amount"]
+        )
+        
+        status_code = 200 if result.get("status") == "success" else 500
+        return Response(result, status=status_code)
+    
 
 class OnlineLoansView(APIView):
     permission_classes = [IsAuthenticated]
@@ -482,21 +770,89 @@ class EditOnlineLoanView(APIView):
 
 
 
+class SelfGuaranteeEligibilityView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        loan_number = request.query_params.get("loan_number")
+        if loan_number is not None:
+            if not loan_number.strip() or len(loan_number) > 20:
+                return Response({"error": "A valid loan number is required."}, status=400)
+            try:
+                limit = guarantorship_policy(
+                    "GetSelfGuaranteeLimit", raw=True,
+                    memberNo=request.user.get_username(), loanNumber=loan_number,
+                )
+            except AttributeError as exc:
+                if "GetSelfGuaranteeLimit" not in str(exc):
+                    logger.exception("Could not load the self-guarantee limit.")
+                    return Response({"error": "Could not load your self-guarantee limit."}, status=502)
+                return Response({"error": "Self-guarantee is unavailable until the ERP service is updated."}, status=503)
+            except Exception:
+                logger.exception("Could not load the self-guarantee limit.")
+                return Response({"error": "Could not load your self-guarantee limit."}, status=502)
+            if limit < 0:
+                return Response({"error": "This loan is unavailable for self-guarantee."}, status=403)
+            return Response({"max_amount": str(limit)}, headers={"Cache-Control": "private, no-store"})
+
+        loan_type = request.query_params.get("loan_type", "").strip()
+        if not loan_type or len(loan_type) > 30:
+            return Response({"error": "A valid loan type is required."}, status=400)
+        try:
+            allowed = guarantorship_policy("AllowsSelfGuarantee", loanType=loan_type)
+        except Exception:
+            logger.exception("Could not check self-guarantee eligibility.")
+            return Response({"error": "Could not check self-guarantee eligibility."}, status=502)
+        return Response({"allowed": allowed})
+
+
 class RequestGuarantorshipView(APIView):
     permission_classes = [IsAuthenticated]
+
     def post(self, request):
         member_number = request.data.get("member_number")
         loan_number = request.data.get("loan_number")
 
-        if not member_number or not loan_number:
-            return Response({"error": "member_number and loan_number are required."}, status=400)
+        if not isinstance(member_number, str) or not member_number.strip() or not isinstance(loan_number, str) or not loan_number.strip():
+            return Response(
+                {"error": "member_number and loan_number are required."},
+                status=400
+            )
 
-        result = request_guarantorship(member_number, loan_number)
+        try:
+            owns_loan = guarantorship_policy(
+                "CanRequestLoanGuarantor",
+                memberNo=request.user.get_username(),
+                loanNo=loan_number,
+            )
+        except Exception:
+            logger.exception("Could not verify loan ownership for guarantorship.")
+            return Response({"error": "Could not verify loan ownership."}, status=502)
+        if not owns_loan:
+            return Response({"error": "This loan is unavailable for guarantorship requests."}, status=403)
+
+        self_amount = None
+        if "self_guarantee_amount" in request.data:
+            if member_number.strip().casefold() != request.user.get_username().strip().casefold():
+                return Response({"error": "Only the borrower can commit deposits."}, status=403)
+            try:
+                self_amount = Decimal(str(request.data["self_guarantee_amount"]))
+                if (not self_amount.is_finite() or not 0 < self_amount < 10 ** 15
+                        or self_amount.as_tuple().exponent < -2):
+                    raise InvalidOperation
+            except (InvalidOperation, ValueError):
+                return Response({"error": "Enter a positive amount with up to two decimal places."}, status=400)
+            member_number = request.user.get_username()
+
+        result = request_guarantorship(member_number, loan_number, self_amount)
 
         if "error" in result:
             return Response(result, status=500)
 
-        return Response(result)
+        if self_amount is not None and not result.get("success"):
+            return Response(result, status=400)
+        return Response(result, status=200)
+
 
 
 class GetLoanGuarantorsView(APIView):
@@ -544,16 +900,48 @@ class MemberShareCertificateView(APIView):
 
 class ApproveGuarantorshipView(APIView):
     permission_classes = [IsAuthenticated]
+    
     def post(self, request):
         data = request.data
         member_no = data.get("memberNo")
         loan_no = data.get("loanNo")
         approved_status = data.get("approvedStatus")
 
-        if not all([member_no, loan_no, approved_status in ["0", "1", 0, 1]]):
-            return Response({"error": "memberNo, loanNo, and approvedStatus (0 or 1) are required"}, status=400)
+        # Validate input
+        if not all([member_no, loan_no, approved_status is not None]):
+            return Response(
+                {"error": "memberNo, loanNo, and approvedStatus are required"}, 
+                status=400
+            )
 
-        result = approve_guarantorship(member_no, loan_no, approved_status)
+        # Validate approved_status
+        try:
+            approved_status_int = int(approved_status)
+            if approved_status_int not in [0, 1]:
+                return Response(
+                    {"error": "approvedStatus must be 0 (reject) or 1 (approve)"}, 
+                    status=400
+                )
+        except ValueError:
+            return Response(
+                {"error": "approvedStatus must be a number (0 or 1)"}, 
+                status=400
+            )
+
+        signed_in_member = request.user.get_username()
+        if str(member_no).strip().upper() != signed_in_member.strip().upper():
+            return Response({"error": "You can only respond to your own guarantorship requests."}, status=403)
+
+        amount = None
+        if approved_status_int == 0 and data.get("amount") is not None:
+            try:
+                amount = Decimal(str(data["amount"]))
+                if not amount.is_finite() or amount <= 0 or amount.as_tuple().exponent < -2:
+                    raise ValueError
+            except (InvalidOperation, ValueError):
+                return Response({"error": "Enter a positive amount with up to two decimal places."}, status=400)
+
+        result = approve_guarantorship(signed_in_member, loan_no, approved_status_int, amount)
 
         if "error" in result:
             return Response(result, status=500)
@@ -639,7 +1027,7 @@ class DeleteLoanApplicationView(APIView):
 
 
 class LoansForGuaranteeView(APIView):
-    #permission_classes = [IsAuthenticated]
+    # permission_classes = [IsAuthenticated]
 
     def get(self, request):
         member = request.query_params.get('member')
@@ -761,6 +1149,9 @@ class UpdateNomineeView(APIView):
         if missing:
             return Response({"error": f"Missing fields: {', '.join(missing)}"}, status=400)
 
+        if not isinstance(data.get("nomineeIsGuardian", False), bool) or not isinstance(data["nomineeIsBeneficiary"], bool):
+            return Response({"message": "Guardian and beneficiary flags must be boolean."}, status=400)
+
         result = update_member_nominee(
             member_number=data['memberNumber'],
             nominee_name=data['nomineeName'],
@@ -773,9 +1164,37 @@ class UpdateNomineeView(APIView):
             nominee_allocation=data['nomineeAllocation'],
             nominee_guardian=data['nomineeGuardian'],
             nominee_telephone=data['nomineeTelephone'],
+            nominee_is_guardian=data.get('nomineeIsGuardian', False),
         )
 
         if result["status"] == "success":
             return Response(result, status=status.HTTP_200_OK)
-        else:
+        if result["status"] == "rejected":
+            return Response(result, status=status.HTTP_400_BAD_REQUEST)
+        return Response(result, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+class MemberBlacklistStatusView(APIView):
+    permission_classes = [IsAuthenticated]
+    def get(self, request) -> Response:
+        bosa_no = request.query_params.get("bosa_no")
+
+        if not bosa_no:
+            return Response(
+                {"error": "bosa_no is required"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            result = get_member_blacklist_status(bosa_no)
+        except Exception as e:
+            logger.exception(f"Failed to get blacklist status for bosa_no={bosa_no}")
+            return Response(
+                {"error": "An unexpected error occurred."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+        if "error" in result:
             return Response(result, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        return Response(result, status=status.HTTP_200_OK)

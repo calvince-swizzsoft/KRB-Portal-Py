@@ -2,20 +2,18 @@ from zeep import Client, Settings
 from zeep.transports import Transport
 from requests import Session
 from requests.auth import HTTPBasicAuth
+import os
 import random
 import string
 import hashlib
 import json
 import base64
 import re
-import re
 from zeep.helpers import serialize_object
 
-WSDL_URL = 'http://krbsc25:7047/BC250/WS/KRB%20SACCO%20TEST%203/Codeunit/portalService?wsdl'
-#http://krbsc25:7047/BC250/WS/KRB%20SACCO%20TEST/Codeunit/portalService
-# OPTIONAL: If credentials are needed, insert them here
-USERNAME = 'KRBADMIN'
-PASSWORD = 'KRBAdmin@2025'
+WSDL_URL = os.environ['PORTAL_WSDL_URL']
+USERNAME = os.environ['PORTAL_SOAP_USERNAME']
+PASSWORD = os.environ['PORTAL_SOAP_PASSWORD']
 
 def get_member_account_statistics(member_no):
     session = Session()
@@ -215,12 +213,16 @@ def get_member_profile(member_no):
     try:
         # 1) Fetch Member Profile
         response = client.service.FnGetMemberProfile(memberNo=member_no)
-        return_value = getattr(response, 'return_value', str(response)).strip()
+        return_value = (getattr(response, "return_value", response) or "").strip()
+        main_part, separator, image_data = return_value.rpartition(":")
+        if not separator or not main_part:
+            return {"status": "error", "message": "Member profile is unavailable"}
 
-        # split off final colon-delimited image data
-        idx = return_value.rfind(':')
-        main_part = return_value[:idx]
-        image_data = return_value[idx+1:].strip()
+        # The versioned suffix leaves legacy profile fields and the final photo in place.
+        document_fields = main_part.rsplit(":", 4)
+        id_front, id_back, kra_document = "", "", ""
+        if len(document_fields) == 5 and document_fields[1] == "PROFILE_DOCUMENTS_V1":
+            main_part, _, id_front, id_back, kra_document = document_fields
 
         parts = [p.strip() for p in main_part.split(":")]
 
@@ -235,7 +237,10 @@ def get_member_profile(member_no):
             "KRAPin":       parts[9] if len(parts)>9 else "",
             "NHIFNumber":   parts[10] if len(parts)>10 else "",
             "JoinDate":     parts[12] if len(parts)>12 else "",
-            "ImageBase64":  image_data
+            "ImageBase64": image_data.strip(),
+            "IdFrontBase64": id_front.strip(),
+            "IdBackBase64": id_back.strip(),
+            "KraPinDocumentBase64": kra_document.strip(),
         }
 
         # 2) Fetch Next of Kin
@@ -567,7 +572,11 @@ def get_loan_products_with_details():
 
 
 
-def apply_for_loan(bosa_no, loan_type, loan_amount, loan_purpose, repayment_period):
+def apply_for_loan(
+    bosa_no, loan_type, loan_amount, loan_purpose,
+    repayment_period, disbursement_mode, recovery_mode, account_or_mpesa_no,
+    member_bank
+):
     session = Session()
     if USERNAME and PASSWORD:
         session.auth = HTTPBasicAuth(USERNAME, PASSWORD)
@@ -577,60 +586,308 @@ def apply_for_loan(bosa_no, loan_type, loan_amount, loan_purpose, repayment_peri
     client = Client(wsdl=WSDL_URL, transport=transport, settings=settings)
 
     try:
+        print(f"\n{'='*50}")
+        print("STEP 1: Fetching loan product details...")
+        print(f"Loan Type: {loan_type}")
+        
         product_details = client.service.FnGetLoanProductDetails(productType=loan_type)
+        print(f"Product details response: {product_details}")
+        
         parts = product_details.split(":::")
         if len(parts) != 4:
-            return {"error": "Invalid loan product configuration"}
+            error_msg = "Invalid loan product configuration"
+            print(f"ERROR: {error_msg}")
+            return {"status": "error", "message": error_msg}
 
         min_amount = float(parts[0].replace(",", "").strip())
         max_amount = float(parts[1].replace(",", "").strip())
         max_installments = int(parts[3].strip())
+        
+        print(f"Product validation:")
+        print(f"  Min Amount: {min_amount}")
+        print(f"  Max Amount: {max_amount}")
+        print(f"  Max Installments: {max_installments}")
 
     except Exception as e:
-        return {"error": f"Failed to fetch product details: {str(e)}"}
+        error_msg = f"Failed to fetch product details: {str(e)}"
+        print(f"ERROR: {error_msg}")
+        return {"status": "error", "message": error_msg}
 
-    # Step 2: Validate loan request
     try:
         loan_amount = float(loan_amount)
         repayment_period = int(repayment_period)
     except:
-        return {"error": "Loan amount and repayment period must be valid numbers"}
+        error_msg = "Loan amount and repayment period must be valid numbers"
+        print(f"ERROR: {error_msg}")
+        return {"status": "error", "message": error_msg}
 
     if loan_amount < min_amount:
-        return {"error": f"Loan amount must be at least {min_amount}"}
+        error_msg = f"Loan amount must be at least {min_amount}"
+        print(f"ERROR: {error_msg}")
+        return {"status": "error", "message": error_msg}
+    
     if loan_amount > max_amount:
-        return {"error": f"Loan amount must not exceed {max_amount}"}
+        error_msg = f"Loan amount must not exceed {max_amount}"
+        print(f"ERROR: {error_msg}")
+        return {"status": "error", "message": error_msg}
+    
     if repayment_period > max_installments:
-        return {"error": f"Repayment period exceeds max allowed: {max_installments} months"}
+        error_msg = f"Repayment period exceeds max allowed: {max_installments} months"
+        print(f"ERROR: {error_msg}")
+        return {"status": "error", "message": error_msg}
 
-    # Step 3: Submit loan application
     try:
+        print(f"\n{'='*50}")
+        print("STEP 2: Submitting loan application to SOAP API...")
+        print("Loan Application Parameters:")
+        print(f"  bosaNo: {bosa_no}")
+        print(f"  loanType: {loan_type}")
+        print(f"  loanAmount: {loan_amount}")
+        print(f"  loanpurpose: {loan_purpose}")
+        print(f"  repaymentPeriod: {repayment_period}")
+        print(f"  disbursementMode: {disbursement_mode}")
+        print(f"  recoveryMode: {recovery_mode}")
+        print(f"  accountOrMpesaNo: {account_or_mpesa_no}")
+        print(f"  memberBank: {member_bank}")
+        
         response = client.service.OnlineLoanApplication(
             bosaNo=bosa_no,
             loanType=loan_type,
             loanAmount=loan_amount,
             loanpurpose=loan_purpose,
-            repaymentPeriod=repayment_period
+            repaymentPeriod=repayment_period,
+            disbursementMode=disbursement_mode,
+            recoveryMode=recovery_mode,
+            accountOrMpesaNo=account_or_mpesa_no,
+            memberBank=member_bank
         )
 
-        message = str(response).strip().upper()
+        message = str(response).strip()
+        message_upper = message.upper()
+        
+        print(f"\n{'='*50}")
+        print("SOAP API RESPONSE:")
+        print(f"Raw message: {message}")
+        print(f"Message length: {len(message)} chars")
+        print(f"Is numeric/loan-like: {message.isalnum() and len(message) <= 20}")
 
-        if "FAILED" in message:
+        # Check if response looks like a loan number (e.g., "PLN030", "LN1270")
+        if message and message.isalnum() and len(message) <= 20:
+            print(f"\n✅ LOAN APPLICATION SUCCESSFUL!")
+            print(f"Loan Number received: {message}")
+            
+            # If it looks like a loan number, treat it as success
+            # Check if it might be an error code (starts with ERROR, FAILED, etc)
+            if any(error_word in message_upper for error_word in ["ERROR", "FAILED", "INVALID", "REJECTED"]):
+                print(f"❌ Looks like an error code")
+                return {
+                    "status": "error",
+                    "message": message
+                }
+            else:
+                # It's a loan number - success!
+                return {
+                    "status": "success",
+                    "message": f"Loan application submitted successfully. Loan Number: {message}",
+                    "loan_no": message  # The entire message is the loan number
+                }
+        
+        # Check for explicit failure messages
+        if "FAILED" in message_upper or "ERROR" in message_upper:
+            print(f"\n❌ LOAN APPLICATION FAILED:")
+            print(f"Error message: {message}")
             return {
                 "status": "error",
                 "message": message
             }
+        elif "SUCCESS" in message_upper or "APPROVED" in message_upper or "PENDING" in message_upper:
+            print(f"\n✅ LOAN APPLICATION SUCCESSFUL:")
+            print(f"Success message: {message}")
+            
+            # For success messages, check if we can extract a loan number
+            loan_no = None
+            import re
+            
+            # Try to extract loan number from success message
+            loan_no_match = re.search(r'LOAN\s*NO\s*[:=\-]?\s*([A-Z0-9]+)', message_upper)
+            if loan_no_match:
+                loan_no = loan_no_match.group(1)
+                print(f"Extracted Loan Number: {loan_no}")
+            
+            return {
+                "status": "success",
+                "message": message,
+                "loan_no": loan_no
+            }
         else:
+            # Unknown response - assume success if it doesn't look like an error
+            print(f"\n⚠️  UNKNOWN RESPONSE - Assuming success:")
+            print(f"Message: {message}")
             return {
                 "status": "success",
                 "message": message
             }
 
     except Exception as e:
-        return {"status": "error", "message": f"Loan application failed: {str(e)}"}
+        error_msg = f"Loan application failed: {str(e)}"
+        print(f"\n❌ EXCEPTION IN LOAN APPLICATION:")
+        print(f"Error: {error_msg}")
+        import traceback
+        print(f"Traceback: {traceback.format_exc()}")
+        return {"status": "error", "message": error_msg}
 
 
+def get_member_existing_loans(bosa_no):
+    session = Session()
+    if USERNAME and PASSWORD:
+        session.auth = HTTPBasicAuth(USERNAME, PASSWORD)
 
+    transport = Transport(session=session, timeout=30)
+    settings = Settings(strict=False, xml_huge_tree=True)
+    client = Client(wsdl=WSDL_URL, transport=transport, settings=settings)
+
+    try:
+        response = client.service.GetMemberExistingLoans(bosaNo=bosa_no)
+
+        data = response.strip()
+
+        if not data or "no loans" in data.lower():
+            return []
+
+        loans = []
+
+        # 🔥 1. Split by "??" to get each loan block
+        loan_blocks = [x for x in data.split("??") if x.strip()]
+
+        for block in loan_blocks:
+
+            loan_dict = {}
+
+            # 2. Split block by "!!" to get "loanNo:LN1115", "ProductName:DEVELOPMENT LOAN 1", etc.
+            fields = block.split("!!")
+
+            for field in fields:
+                if ":" not in field:
+                    continue
+
+                key, value = field.split(":", 1)
+                key = key.strip()
+                value = value.strip()
+
+                # Parse numbers that contain commas
+                if key in ["Outstanding", "ArrearsAmt"]:
+                    try:
+                        loan_dict[key] = float(value.replace(",", ""))
+                    except:
+                        loan_dict[key] = 0.0
+                elif key == "ArrearsDays":
+                    try:
+                        loan_dict[key] = int(value)
+                    except:
+                        loan_dict[key] = 0
+                else:
+                    loan_dict[key] = value
+
+            # Add alias "Product"
+            if "ProductName" in loan_dict:
+                loan_dict["Product"] = loan_dict["ProductName"]
+
+            if loan_dict.get("LoanNo"):
+                loans.append(loan_dict)
+
+        return loans
+
+    except Exception as e:
+        print("Error:", e)
+        return {"error": str(e)}
+
+def apply_loan_refinancing(bosa_no, loan_no, loan_top_up_no, loan_type, amount):
+    """
+    SOAP API call for loan refinancing/offsetting
+    """
+    session = Session()
+    if USERNAME and PASSWORD:
+        session.auth = HTTPBasicAuth(USERNAME, PASSWORD)
+
+    transport = Transport(session=session, timeout=30)
+    settings = Settings(strict=False, xml_huge_tree=True)
+    client = Client(wsdl=WSDL_URL, transport=transport, settings=settings)
+
+    try:
+        amount = float(amount)
+        
+        print(f"\n{'='*60}")
+        print("🔄 REFINANCING SOAP API CALL")
+        print(f"{'='*60}")
+        print("Parameters:")
+        print(f"  bosaNo: {bosa_no}")
+        print(f"  loanNo (NEW loan): {loan_no}")
+        print(f"  loanTopUpNo (EXISTING loan): {loan_top_up_no}")
+        print(f"  loanType: {loan_type}")
+        print(f"  amount: {amount}")
+        
+        # Try to map product name to code if needed
+        product_mapping = {
+            "INSTANT LOAN": "IL",
+            "EMERGENCY LOAN": "EL",
+            "SCHOOL FEES LOAN": "SFL",
+            "DEVELOPMENT LOAN": "DL",
+            "NORMAL LOAN": "NL",
+            "IL": "IL",
+            "EL": "EL",
+            "SFL": "SFL",
+            "DL": "DL",
+            "NL": "NL"
+        }
+        
+        # Use mapping or original loan_type
+        loan_type_to_use = product_mapping.get(loan_type.upper().strip(), loan_type)
+        print(f"  loanType (after mapping): {loan_type_to_use}")
+        
+        print(f"\nCalling SOAP API: OnlineLoanRefinancing...")
+        response = client.service.OnlineLoanRefinancing(
+            bosaNo=bosa_no,
+            loanNo=loan_no,
+            loanTopUpNo=loan_top_up_no,
+            loanType=loan_type_to_use,
+            amount=amount
+        )
+        
+        message = str(response).strip()
+        message_upper = message.upper()
+        
+        print(f"\nSOAP API Response:")
+        print(f"  Raw message: {message}")
+        print(f"  Message length: {len(message)} chars")
+        print(f"  Contains 'SUCCESS': {'SUCCESS' in message_upper}")
+        print(f"  Contains 'FAILED': {'FAILED' in message_upper}")
+        print(f"  Contains 'ERROR': {'ERROR' in message_upper}")
+        
+        if "FAILED" in message_upper or "ERROR" in message_upper:
+            print(f"\n❌ REFINANCING FAILED")
+            print(f"Error message: {message}")
+            return {
+                "status": "error",
+                "message": message
+            }
+        else:
+            print(f"\n✅ REFINANCING SUCCESSFUL")
+            print(f"Success message: {message}")
+            return {
+                "status": "success",
+                "message": message
+            }
+            
+    except Exception as e:
+        error_msg = f"Loan refinancing failed: {str(e)}"
+        print(f"\n❌ EXCEPTION IN REFINANCING:")
+        print(f"Error: {error_msg}")
+        import traceback
+        print(f"Traceback: {traceback.format_exc()}")
+        return {"status": "error", "message": error_msg}
+
+
+        
 def get_online_applied_loans(member_no):
     session = Session()
     if USERNAME and PASSWORD:
@@ -731,34 +988,53 @@ def edit_online_loan(loan_number, member_number, amount_request, loan_type, repa
         return {"error": str(e)}
 
 
+def guarantorship_policy(operation, *, raw=False, **parameters):
+    session = Session()
+    if USERNAME and PASSWORD:
+        session.auth = HTTPBasicAuth(USERNAME, PASSWORD)
+
+    transport = Transport(session=session, timeout=30)
+    client = Client(wsdl=WSDL_URL, transport=transport)
+    result = getattr(client.service, operation)(**parameters)
+    return result if raw else result is True
 
 
-
-
-
-
-def request_guarantorship(member_number, loan_number):
+def request_guarantorship(member_number, loan_number, self_amount=None):
     session = Session()
     if USERNAME and PASSWORD:
         session.auth = HTTPBasicAuth(USERNAME, PASSWORD)
 
     transport = Transport(session=session, timeout=30)
     settings = Settings(strict=False, xml_huge_tree=True)
-    client = Client(wsdl=WSDL_URL, transport=transport, settings=settings)
-
+    
     try:
-        result = client.service.FnRequestGuarantorship(
-            bosaNo=member_number,  # Correct param name
-            loanNumber=loan_number,
-        )
-
-        if str(result).strip().lower() == "true":
-            return {"message": "Request sent successfully"}
+        client = Client(wsdl=WSDL_URL, transport=transport, settings=settings)
+        
+        parameters = {"bosaNo": member_number, "loanNumber": loan_number, "response": ""}
+        if self_amount is None:
+            result = client.service.FnRequestGuarantorship(**parameters)
         else:
-            return {"message": "Request not submitted. Cannot add member as guarantor."}
+            result = client.service.FnRequestSelfGuarantee(amount=self_amount, **parameters)
+
+        # Handle the response
+        if hasattr(result, 'return_value') and result.return_value is True:
+            return {
+                "success": True,
+                "message": result.response if hasattr(result, 'response') else "Success"
+            }
+        else:
+            error_msg = result.response if hasattr(result, 'response') else "Request failed"
+            return {
+                "success": False,
+                "message": error_msg
+            }
 
     except Exception as e:
-        return {"error": f"Failed to send request guarantorship: {str(e)}"}
+        import traceback
+        error_msg = str(e)
+        print(f"SOAP Error: {error_msg}")
+        print(traceback.format_exc())
+        return {"error": f"Failed to send request guarantorship: {error_msg}"}
 
 
 
@@ -799,26 +1075,86 @@ def get_loan_guarantors(loan_no, member_number):
 
 
 
-def approve_guarantorship(member_no, loan_no, approved_status):
+def approve_guarantorship(member_no, loan_no, approved_status, amount=None):
     session = Session()
     if USERNAME and PASSWORD:
         session.auth = HTTPBasicAuth(USERNAME, PASSWORD)
 
     transport = Transport(session=session, timeout=30)
     settings = Settings(strict=False, xml_huge_tree=True)
-    client = Client(wsdl=WSDL_URL, transport=transport, settings=settings)
-
+    
     try:
-        result = client.service.ApproveGuarantorship(
-            memberNo=member_no,
-            loanNo=loan_no,
-            approvedStatus=int(approved_status)
-        )
+        client = Client(wsdl=WSDL_URL, transport=transport, settings=settings)
+        
+        if approved_status == 0 and amount is not None:
+            result = client.service.ApproveGuarantorshipWithAmount(
+                memberNo=str(member_no), loanNo=str(loan_no), amount=amount
+            )
+        else:
+            result = client.service.ApproveGuarantorship(
+                memberNo=str(member_no), loanNo=str(loan_no), approvedStatus=approved_status
+            )
 
-        return {"message": "Guarantorship request approved successfully"}
+        message = getattr(result, "return_value", result)
+        if isinstance(message, str):
+            normalized = message.strip().lower()
+            expected = "true" if approved_status == 0 else "false"
+            if normalized == expected:
+                action = "approved" if approved_status == 0 else "rejected"
+                return {"success": True, "message": f"Guarantorship request {action} successfully"}
+            success = normalized.startswith(("success", "approval recorded.", "rejection recorded."))
+            return {"success": success, "message": message}
+        
+        # Debug the result structure
+        print(f"SOAP Result: {result}")
+        print(f"Result type: {type(result)}")
+        
+        # Check if the result is successful
+        if hasattr(result, 'return_value'):
+            if result.return_value is True:
+                action = "approved" if approved_status == 0 else "rejected"
+                return {
+                    "success": True,
+                    "message": f"Guarantorship request {action} successfully"
+                }
+            else:
+                action = "approve" if approved_status == 0 else "reject"
+                return {
+                    "success": False,
+                    "message": f"Failed to {action} guarantorship request"
+                }
+        # If result is a simple boolean
+        elif isinstance(result, bool):
+            if result:
+                action = "approved" if approved_status == 0 else "rejected"
+                return {
+                    "success": True,
+                    "message": f"Guarantorship request {action} successfully"
+                }
+            else:
+                action = "approve" if approved_status == 0 else "reject"
+                return {
+                    "success": False,
+                    "message": f"Failed to {action} guarantorship request"
+                }
+        # If result is a tuple or dict
+        else:
+            action = "approved" if approved_status == 0 else "rejected"
+            return {
+                "success": True,
+                "message": f"Guarantorship request {action} successfully"
+            }
 
     except Exception as e:
-        return {"error": str(e)}
+        import traceback
+        error_msg = str(e)
+        print(f"SOAP Error: {error_msg}")
+        print(traceback.format_exc())
+        return {"error": f"Failed to process guarantorship: {error_msg}"}
+    
+import logging
+
+logging.basicConfig(level=logging.INFO)
 
 def submit_loan(member_number, loan_number):
     session = Session()
@@ -835,10 +1171,21 @@ def submit_loan(member_number, loan_number):
             loanNumber=loan_number
         )
 
-        return {"message": "Loan submitted successfully"}
+        # Convert Zeep object to Python dict (if applicable)
+        response_data = serialize_object(result)
+
+        logging.info("SubmitLoan Response: %s", response_data)
+        print("SubmitLoan Response:", response_data)
+
+        return {
+            "message": "Loan submitted successfully",
+            "data": response_data
+        }
 
     except Exception as e:
+        logging.exception("SubmitLoan failed")
         return {"error": str(e)}
+    
 
 
 
@@ -885,8 +1232,8 @@ def get_loan_details(member_no, loan_no):
 
     try:
         result = client.service.fnOnlineLoan(
-            memberNumber=member_no,  # ✅ CORRECT PARAM NAME
-            loanNumber=loan_no       # ✅ CORRECT PARAM NAME
+            memberNumber=member_no,  
+            loanNumber=loan_no       
         )
 
         print("Raw fnOnlineLoan result:", result)
@@ -1107,6 +1454,10 @@ def update_member_next_of_kin(
     next_of_kin_dob,
     next_of_kin_telephone
 ):
+    expected_id = (next_of_kin_id_number or "").strip()
+    if len(expected_id) > 20:
+        return {"error": "Next-of-kin ID number cannot exceed 20 characters.", "code": "next_of_kin_validation"}
+
     session = Session()
     if USERNAME and PASSWORD:
         session.auth = HTTPBasicAuth(USERNAME, PASSWORD)
@@ -1122,13 +1473,37 @@ def update_member_next_of_kin(
             nextOfKinAddress=next_of_kin_address,
             nextOfKinIsBeneficiary=next_of_kin_is_beneficiary,
             nextOfKinEmail=next_of_kin_email,
-            nextOfKinIdNumber=next_of_kin_id_number,
+            nextOfKinIdNumber=expected_id,
             nextOfKinRelationshipType=next_of_kin_relationship_type,
             nextOfKinDOB=next_of_kin_dob,
             nextOfKinTelephone=next_of_kin_telephone
         )
 
-        return {"success": True, "message": result}
+        message = str(getattr(result, "return_value", result) or "").strip()
+        if message.casefold() not in {
+            "next of kin added successfuly",
+            "next of kin updated successfuly",
+            "next of kin added successfully",
+            "next of kin updated successfully",
+        }:
+            if message.casefold() == "relationship type is required":
+                return {"error": "Relationship type is required.", "code": "next_of_kin_validation"}
+            return {"error": "The ERP did not confirm the save.", "code": "next_of_kin_unconfirmed"}
+
+        if expected_id:
+            stored = get_next_of_kin(member_number)
+            matching_id = any(
+                record.get("Name", "").strip().casefold() == (next_of_kin_name or "").strip().casefold()
+                and record.get("IDNumber", "").strip().casefold() == expected_id.casefold()
+                for record in stored.get("next_of_kin", [])
+            )
+            if not matching_id:
+                return {
+                    "error": "The ERP did not confirm the saved next-of-kin ID number.",
+                    "code": "next_of_kin_unconfirmed",
+                }
+
+        return {"success": True, "message": message}
 
     except Exception as e:
         return {"error": str(e)}
@@ -1144,7 +1519,8 @@ def update_member_nominee(
     nominee_dob,
     nominee_allocation,
     nominee_guardian,
-    nominee_telephone
+    nominee_telephone,
+    nominee_is_guardian=False,
 ):
     session = Session()
     if USERNAME and PASSWORD:
@@ -1167,9 +1543,21 @@ def update_member_nominee(
             nomineeAllocation=float(nominee_allocation),
             nomineeGuardian=nominee_guardian,
             nomineeTelephone=nominee_telephone,
+            nomineeIsGuardian=nominee_is_guardian,
         )
 
-        return {"status": "success", "message": result}
+        message = str(getattr(result, "return_value", result) or "").strip()
+        if message not in {"Nominee added successfuly", "Nominee modified successfuly"}:
+            return {"status": "rejected", "message": message or "The ERP did not confirm the save."}
+        return {"status": "success", "message": message}
+    except TypeError as exc:
+        if "unexpected keyword" in str(exc).lower() and "nomineeisguardian" in str(exc).lower():
+            return {
+                "status": "error",
+                "code": "nominee_service_outdated",
+                "message": "The ERP service does not support nominee record types yet. Contact support.",
+            }
+        return {"status": "error", "message": "The ERP could not process this nominee request."}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
@@ -1186,33 +1574,23 @@ def get_next_of_kin(member_no):
 
     try:
         response = client.service.fnGetNextofkin(memberNumber=member_no)
-        raw = ""
-        if hasattr(response, 'return_value'):
-            raw = response.return_value or ""
-        else:
-            raw = str(response)
-
-        raw = raw.strip()
+        raw = (getattr(response, "return_value", response) or "").strip()
         if not raw:
             return {"status": "success", "next_of_kin": []}
 
-        # 1) Split entries by '::::'
-        entries = [e for e in raw.split("::::") if e.strip()]
-
-        kin_list = []
-        for entry in entries:
-            # 2) Split fields by ':::'
-            parts = [p.strip() for p in entry.split(":::")]
-
-            kin = {
-                "Name": parts[0] if len(parts) > 0 else "",
-                "Relationship": parts[1] if len(parts) > 1 else "",
-                "Email": parts[2] if len(parts) > 2 else "",
-                "Allocation": parts[3] if len(parts) > 3 else "",
-                "Guardian": parts[7] if len(parts) > 7 else "",
-                "Telephone": parts[8] if len(parts) > 8 else "",
-            }
-            kin_list.append(kin)
+        if raw.startswith("["):
+            kin_list = json.loads(raw)
+        else:
+            # Older ERP versions return name, relationship, email, and telephone.
+            kin_list = []
+            for match in re.finditer(r"(.*?):::(.*?):::(.*?):::(.*?)::::", raw):
+                name, relationship, email, telephone = (field.strip() for field in match.groups())
+                kin_list.append({
+                    "Name": name,
+                    "Relationship": relationship,
+                    "Email": email,
+                    "Telephone": telephone,
+                })
 
         return {"status": "success", "next_of_kin": kin_list}
 
@@ -1233,15 +1611,11 @@ def get_member_nominees(member_no):
     try:
         response = client.service.FnGetNOKProfile(memberNo=member_no)
 
-        raw = ""
-        if hasattr(response, 'return_value'):
-            raw = response.return_value or ""
-        else:
-            raw = str(response)
-
-        raw = raw.strip()
+        raw = (getattr(response, "return_value", response) or "").strip()
         if not raw:
             return {"status": "success", "nominees": []}
+        if raw.startswith("["):
+            return {"status": "success", "nominees": json.loads(raw)}
 
         # 1) Split entries by double-colon delimiter "::"
         entries = [e for e in raw.split("::") if e.strip()]
@@ -1264,3 +1638,33 @@ def get_member_nominees(member_no):
 
     except Exception as e:
         return {"status": "error", "message": str(e), "nominees": []}
+
+
+
+def get_member_blacklist_status(bosa_no):
+    session = Session()
+    if USERNAME and PASSWORD:
+        session.auth = HTTPBasicAuth(USERNAME, PASSWORD)
+
+    transport = Transport(session=session, timeout=30)
+    settings = Settings(strict=False, xml_huge_tree=True)
+    client = Client(wsdl=WSDL_URL, transport=transport, settings=settings)
+
+    try:
+        result = client.service.GetMemberBlacklistStatus(bosaNo=bosa_no)
+        raw_result = str(result).strip()
+
+        if not raw_result:
+            return {"error": "No blacklist status returned"}
+
+        # Parse the semicolon-separated result into a dict
+        parsed_data = {}
+        for item in raw_result.split(';'):
+            if ':' in item:
+                key, value = item.split(':', 1)
+                parsed_data[key.strip()] = value.strip()
+
+        return parsed_data
+
+    except Exception as e:
+        return {"error": f"Failed to fetch blacklist status: {str(e)}"}
